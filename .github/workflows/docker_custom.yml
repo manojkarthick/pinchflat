@@ -1,22 +1,17 @@
+# Multi-arch image without QEMU for arm64: Deno (runner stage) crashes under QEMU
+# (SIGILL). Build each arch on a native runner, then merge manifests.
+# Requires a public repo for ubuntu-24.04-arm (free tier); private forks need larger arm runners.
+
 name: Docker Custom Branch
 
 on:
   workflow_dispatch:
     inputs:
-      platforms:
-        type: choice
-        description: Build platforms (multi-arch so Apple Silicon can pull :custom)
-        required: true
-        default: linux/amd64,linux/arm64
-        options:
-          - linux/amd64,linux/arm64
-          - linux/amd64
-          - linux/arm64
       docker_tags:
         type: string
-        description: Primary image tag (sha tag is always added)
-        required: true
-        default: custom
+        description: Extra tag for merged image (in addition to custom and sha-)
+        required: false
+        default: ""
   push:
     branches:
       - custom
@@ -26,33 +21,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build_and_push_docker:
-    runs-on: ubuntu-latest
-    env:
-      # Manifest list must include arm64 for docker pull on Apple Silicon / ARM servers
-      dev_arch: linux/amd64,linux/arm64
+  build_platform:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=custom,enable=${{ github.event_name == 'push' }}
-            type=sha,prefix=sha-,format=short
-            type=raw,value=${{ inputs.docker_tags }},enable=${{ github.event_name == 'workflow_dispatch' }}
-          flavor: |
-            latest=false
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -64,14 +50,45 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push
+      - name: Build and push (single-arch)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./docker/selfhosted.Dockerfile
-          platforms: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms || env.dev_arch }}
+          platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ghcr.io/${{ github.repository }}:arch-${{ github.sha }}-${{ matrix.suffix }}
+          cache-from: type=gha,scope=custom-${{ matrix.suffix }}
+          cache-to: type=gha,scope=custom-${{ matrix.suffix }},mode=max
+
+  merge_manifests:
+    runs-on: ubuntu-latest
+    needs: [build_platform]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        run: |
+          set -eux
+          IMAGE="ghcr.io/${{ github.repository }}"
+          SHA="${{ github.sha }}"
+          SHORT="${SHA:0:7}"
+          SRC_AMD="${IMAGE}:arch-${SHA}-amd64"
+          SRC_ARM="${IMAGE}:arch-${SHA}-arm64"
+          EXTRA="${{ inputs.docker_tags }}"
+          TAGS="-t ${IMAGE}:custom -t ${IMAGE}:sha-${SHORT}"
+          if [ -n "${EXTRA}" ]; then
+            TAGS="${TAGS} -t ${IMAGE}:${EXTRA}"
+          fi
+          docker buildx imagetools create ${TAGS} "${SRC_AMD}" "${SRC_ARM}"
