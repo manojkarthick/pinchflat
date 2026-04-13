@@ -5,12 +5,13 @@ on:
     inputs:
       platforms:
         type: choice
-        description: Build platforms
+        description: Build platforms (multi-arch so Apple Silicon can pull :custom)
         required: true
-        default: linux/amd64
+        default: linux/amd64,linux/arm64
         options:
-          - linux/amd64
           - linux/amd64,linux/arm64
+          - linux/amd64
+          - linux/arm64
       docker_tags:
         type: string
         description: Primary image tag (sha tag is always added)
@@ -28,7 +29,8 @@ jobs:
   build_and_push_docker:
     runs-on: ubuntu-latest
     env:
-      dev_arch: linux/amd64
+      # Manifest list must include arm64 for docker pull on Apple Silicon / ARM servers
+      dev_arch: linux/amd64,linux/arm64
     permissions:
       contents: read
       packages: write
